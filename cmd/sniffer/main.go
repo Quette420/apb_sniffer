@@ -1,0 +1,688 @@
+package main
+
+import (
+	"apb-sniffer/apb"
+	"apb-sniffer/crypto"
+	"apb-sniffer/logger"
+	"apb-sniffer/ue3"
+	"log"
+
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"os"
+	"os/signal"
+	"sort"
+	"strconv"
+	"syscall"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
+)
+
+type PacketStats struct {
+	Count int
+
+	// First packet seen for this UDP payload length.
+	FirstPayload []byte
+
+	ParsedPackets int
+	FailedPackets int
+
+	PacketIDs map[uint32]int
+}
+
+type PacketStatsCache struct {
+	// UDP payload length -> statistics
+	Packets map[int]*PacketStats
+}
+
+func NewPacketStatsCache() *PacketStatsCache {
+	return &PacketStatsCache{
+		Packets: make(map[int]*PacketStats),
+	}
+}
+
+func (c *PacketStatsCache) Observe(
+	payload []byte,
+	packetID *uint32,
+	parseErr error,
+) bool {
+	length := len(payload)
+
+	stats, exists := c.Packets[length]
+
+	if !exists {
+		stats = &PacketStats{
+			FirstPayload: append([]byte(nil), payload...),
+			PacketIDs:    make(map[uint32]int),
+		}
+
+		c.Packets[length] = stats
+	}
+
+	stats.Count++
+
+	if packetID != nil {
+		stats.PacketIDs[*packetID]++
+	}
+
+	if parseErr == nil {
+		stats.ParsedPackets++
+	} else {
+		stats.FailedPackets++
+	}
+
+	return !exists
+}
+
+func (c *PacketStatsCache) Lengths() []int {
+	result := make([]int, 0, len(c.Packets))
+
+	for length := range c.Packets {
+		result = append(result, length)
+	}
+
+	sort.Ints(result)
+
+	return result
+}
+
+func (c *PacketStatsCache) Dump(appLogger *logger.Logger) {
+	appLogger.Debug(
+		"========================================",
+	)
+
+	appLogger.Debug(
+		"Packet statistics",
+	)
+
+	appLogger.Debug(
+		"========================================",
+	)
+
+	for _, length := range c.Lengths() {
+		stats := c.Packets[length]
+
+		ids := make([]uint32, 0, len(stats.PacketIDs))
+
+		for id := range stats.PacketIDs {
+			ids = append(ids, id)
+		}
+
+		sort.Slice(ids, func(i, j int) bool {
+			return ids[i] < ids[j]
+		})
+
+		packetIDs := ""
+
+		for i, id := range ids {
+			if i > 0 {
+				packetIDs += ", "
+			}
+
+			packetIDs += fmt.Sprintf(
+				"%d(%d)",
+				id,
+				stats.PacketIDs[id],
+			)
+		}
+
+		appLogger.Debug(
+			"%d bytes: count=%d parsed=%d failed=%d packetIDs=[%s]",
+			length,
+			stats.Count,
+			stats.ParsedPackets,
+			stats.FailedPackets,
+			packetIDs,
+		)
+
+		appLogger.Trace(
+			"%d bytes first payload:\n%s",
+			length,
+			hex.Dump(stats.FirstPayload),
+		)
+	}
+}
+
+func resolveDevice(
+	devices []pcap.Interface,
+	value string,
+) (string, error) {
+	// Allow:
+	//
+	// -device 10
+	//
+	// as well as:
+	//
+	// -device "\Device\NPF_Loopback"
+
+	if index, err := strconv.Atoi(value); err == nil {
+		if index < 0 || index >= len(devices) {
+			return "", fmt.Errorf(
+				"device index %d out of range",
+				index,
+			)
+		}
+
+		return devices[index].Name, nil
+	}
+
+	for _, device := range devices {
+		if device.Name == value {
+			return device.Name, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"device not found: %s",
+		value,
+	)
+}
+
+func main() {
+	srcPort := flag.Int(
+		"src-port",
+		0,
+		"UDP source port",
+	)
+
+	dstPort := flag.Int(
+		"dst-port",
+		0,
+		"UDP destination port",
+	)
+
+	device := flag.String(
+		"device",
+		"",
+		"Network interface/device or device index",
+	)
+
+	bidirectional := flag.Bool(
+		"bidirectional",
+		false,
+		"Capture both directions",
+	)
+
+	keyHex := flag.String(
+		"key",
+		"",
+		"BTEA key as 32 hexadecimal characters",
+	)
+
+	logLevel := flag.String(
+		"log-level",
+		"info",
+		"log level: error, info, debug, trace",
+	)
+
+	flag.Parse()
+
+	appLogger := logger.New(*logLevel)
+
+	var encryptionKey [16]byte
+
+	if *keyHex != "" {
+		keyBytes, err := hex.DecodeString(*keyHex)
+		if err != nil {
+			log.Fatalf("invalid BTEA key: %v", err)
+		}
+
+		if len(keyBytes) != 16 {
+			log.Fatalf(
+				"BTEA key must be exactly 16 bytes, got %d",
+				len(keyBytes),
+			)
+		}
+
+		copy(encryptionKey[:], keyBytes)
+
+		appLogger.Debug(
+			"BTEA session key configured",
+		)
+	} else {
+		appLogger.Debug(
+			"BTEA session key not configured",
+		)
+	}
+
+	if *srcPort == 0 || *dstPort == 0 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	// ------------------------------------------------------------
+	// Find/select network device
+	// ------------------------------------------------------------
+
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if len(devices) == 0 {
+		log.Fatal("no network interfaces found")
+	}
+
+	if *device == "" {
+		appLogger.Info("Available interfaces:")
+
+		for i, d := range devices {
+			appLogger.Info(
+				"[%d] %s",
+				i,
+				d.Name,
+			)
+
+			for _, addr := range d.Addresses {
+				appLogger.Info(
+					"    %s",
+					addr.IP,
+				)
+			}
+		}
+
+		appLogger.Info(
+			"Use -device to select an interface.",
+		)
+
+		os.Exit(0)
+	}
+
+	dev, err := resolveDevice(devices, *device)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	appLogger.Info(
+		"Device: %s",
+		dev,
+	)
+
+	// ------------------------------------------------------------
+	// Open capture
+	// ------------------------------------------------------------
+
+	handle, err := pcap.OpenLive(
+		dev,
+		65535,
+		true,
+		pcap.BlockForever,
+	)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer handle.Close()
+
+	// ------------------------------------------------------------
+	// BPF filter
+	// ------------------------------------------------------------
+
+	filter := fmt.Sprintf(
+		"udp and src port %d and dst port %d",
+		*srcPort,
+		*dstPort,
+	)
+
+	if *bidirectional {
+		filter = fmt.Sprintf(
+			"udp and ((src port %d and dst port %d) or (src port %d and dst port %d))",
+			*srcPort,
+			*dstPort,
+			*dstPort,
+			*srcPort,
+		)
+	}
+
+	if err := handle.SetBPFFilter(filter); err != nil {
+		log.Fatal(err)
+	}
+
+	appLogger.Info(
+		"BPF filter: %s",
+		filter,
+	)
+
+	// ------------------------------------------------------------
+	// Packet processing
+	// ------------------------------------------------------------
+
+	stats := NewPacketStatsCache()
+
+	packetSource := gopacket.NewPacketSource(
+		handle,
+		handle.LinkType(),
+	)
+
+	packetSource.NoCopy = false
+
+	// ------------------------------------------------------------
+	// Shutdown handling
+	// ------------------------------------------------------------
+
+	signals := make(chan os.Signal, 1)
+
+	signal.Notify(
+		signals,
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+
+	appLogger.Info("Listening...")
+
+	go func() {
+		<-signals
+
+		appLogger.Info("Stopping...")
+
+		handle.Close()
+	}()
+
+	// ------------------------------------------------------------
+	// Capture loop
+	// ------------------------------------------------------------
+
+	for capturedPacket := range packetSource.Packets() {
+		udpLayer := capturedPacket.Layer(
+			layers.LayerTypeUDP,
+		)
+
+		if udpLayer == nil {
+			continue
+		}
+
+		udp, ok := udpLayer.(*layers.UDP)
+
+		if !ok {
+			continue
+		}
+
+		payload := udp.Payload
+
+		if len(payload) == 0 {
+			continue
+		}
+
+		// --------------------------------------------------------
+		// First try plaintext UE3 parsing.
+		// --------------------------------------------------------
+
+		uePacket, parseErr := ue3.ParsePacket(payload)
+
+		decrypted := false
+		decryptAttempted := false
+		decryptParseErr := error(nil)
+
+		// --------------------------------------------------------
+		// If plaintext parsing fails, try BTEA.
+		// --------------------------------------------------------
+
+		if parseErr != nil &&
+			*keyHex != "" &&
+			len(payload) >= 8 &&
+			len(payload)%4 == 0 {
+
+			decryptAttempted = true
+
+			decoded := append(
+				[]byte(nil),
+				payload...,
+			)
+
+			if crypto.BTEADecrypt(
+				decoded,
+				encryptionKey,
+			) {
+				decodedPacket, err :=
+					ue3.ParsePacket(decoded)
+
+				decryptParseErr = err
+
+				if err == nil {
+					uePacket = decodedPacket
+					parseErr = nil
+					decrypted = true
+				}
+			}
+		}
+
+		// --------------------------------------------------------
+		// Statistics
+		// --------------------------------------------------------
+
+		var packetID *uint32
+
+		if parseErr == nil {
+			packetID = &uePacket.PacketID
+		}
+
+		isNewLength := stats.Observe(
+			payload,
+			packetID,
+			parseErr,
+		)
+
+		// --------------------------------------------------------
+		// Parse result
+		// --------------------------------------------------------
+
+		if parseErr != nil {
+			// Plain parse failure is expected for encrypted packets,
+			// so don't report it as ERROR here.
+			if decryptAttempted && decryptParseErr != nil {
+				appLogger.Debug(
+					"UE3 parse failed after BTEA decrypt: length=%d error=%v",
+					len(payload),
+					decryptParseErr,
+				)
+			} else {
+				appLogger.Debug(
+					"UE3 parse failed: length=%d error=%v",
+					len(payload),
+					parseErr,
+				)
+			}
+
+			continue
+		}
+
+		if decrypted {
+			appLogger.Debug(
+				"BTEA decrypt + UE3 parse SUCCESS: length=%d packetID=%d",
+				len(payload),
+				uePacket.PacketID,
+			)
+		} else {
+			appLogger.Debug(
+				"Plain UE3 parse SUCCESS: length=%d packetID=%d",
+				len(payload),
+				uePacket.PacketID,
+			)
+		}
+
+		// --------------------------------------------------------
+		// Only deeply inspect first packet of each length.
+		// --------------------------------------------------------
+
+		if !isNewLength {
+			continue
+		}
+
+		appLogger.Debug(
+			"NEW LENGTH: %d bytes",
+			len(payload),
+		)
+
+		appLogger.Debug(
+			"PacketID: %d",
+			uePacket.PacketID,
+		)
+
+		appLogger.Debug(
+			"PayloadBits: %d",
+			uePacket.PayloadBitCount,
+		)
+
+		appLogger.Debug(
+			"Bunches: %d",
+			len(uePacket.Bunches),
+		)
+
+		for i, bunch := range uePacket.Bunches {
+			logBunch(
+				appLogger,
+				i,
+				bunch,
+			)
+		}
+	}
+
+	// ------------------------------------------------------------
+	// Final statistics
+	// ------------------------------------------------------------
+
+	stats.Dump(appLogger)
+}
+
+func logBunch(
+	appLogger *logger.Logger,
+	index int,
+	bunch ue3.Bunch,
+) {
+	if bunch.Kind == ue3.BunchAck {
+		appLogger.Debug(
+			"Bunch #%d ACK packet=%d",
+			index,
+			bunch.AckPacketID,
+		)
+
+		return
+	}
+
+	appLogger.Debug(
+		"Bunch #%d DATA open=%v close=%v reliable=%v channel=%d sequence=%d type=%d bits=%d bytes=%d",
+		index,
+		bunch.Open,
+		bunch.Close,
+		bunch.Reliable,
+		bunch.ChannelIndex,
+		bunch.ChannelSequence,
+		bunch.ChannelType,
+		bunch.DataBitCount,
+		len(bunch.RawData),
+	)
+
+	// ------------------------------------------------------------
+	// Known controller decoding.
+	// ------------------------------------------------------------
+
+	if bunch.ChannelType == 2 {
+		fields, err := apb.DecodeControllerFields(
+			bunch,
+			634,
+		)
+
+		if err != nil {
+			appLogger.Info(
+				"UNKNOWN controller field",
+				"channel", bunch.ChannelIndex,
+				"type", bunch.ChannelType,
+				"sequence", bunch.ChannelSequence,
+				"reliable", bunch.Reliable,
+				"open", bunch.Open,
+				"close", bunch.Close,
+				"data_bits", bunch.DataBitCount,
+				"data_bytes", len(bunch.RawData),
+				"error", err,
+				"raw_hex", hex.EncodeToString(bunch.RawData),
+			)
+
+			appLogger.Info(
+				"UNKNOWN controller field raw dump",
+				"dump", hex.Dump(bunch.RawData),
+			)
+		}
+
+		for _, field := range fields {
+			if field.Known {
+				appLogger.Debug(
+					"KNOWN controller field",
+					"index", field.Index,
+					"name", field.Name,
+					"begin_bit", field.BeginBit,
+					"end_bit", field.EndBit,
+				)
+			} else {
+				appLogger.Info(
+					"UNKNOWN controller field detail",
+					"index", field.Index,
+					"begin_bit", field.BeginBit,
+					"end_bit", field.EndBit,
+				)
+			}
+		}
+
+		for _, field := range fields {
+			if field.Known {
+				appLogger.Debug(
+					"KNOWN field=%d name=%s bits=%d..%d",
+					field.Index,
+					field.Name,
+					field.BeginBit,
+					field.EndBit,
+				)
+
+				continue
+			}
+
+			appLogger.Info(
+				"UNKNOWN channel=%d type=%d reliable=%v open=%v close=%v bits=%d bytes=%d",
+				bunch.ChannelIndex,
+				bunch.ChannelType,
+				bunch.Reliable,
+				bunch.Open,
+				bunch.Close,
+				bunch.DataBitCount,
+				len(bunch.RawData),
+			)
+		}
+
+		if err != nil {
+			appLogger.Info(
+				"UNKNOWN controller field: channel=%d type=%d error=%v",
+				bunch.ChannelIndex,
+				bunch.ChannelType,
+				err,
+			)
+		}
+
+		return
+	}
+
+	// ------------------------------------------------------------
+	// No decoder exists yet for this channel/type.
+	// This is intentionally INFO because this is what we're
+	// currently investigating.
+	// ------------------------------------------------------------
+
+	appLogger.Info(
+		"UNKNOWN channel=%d type=%d reliable=%v open=%v close=%v bits=%d bytes=%d",
+		bunch.ChannelIndex,
+		bunch.ChannelType,
+		bunch.Reliable,
+		bunch.Open,
+		bunch.Close,
+		bunch.DataBitCount,
+		len(bunch.RawData),
+	)
+
+	appLogger.Trace(
+		"UNKNOWN channel=%d raw data:\n%s",
+		bunch.ChannelIndex,
+		hex.Dump(bunch.RawData),
+	)
+}
