@@ -90,7 +90,10 @@ func (r *BitReader) ReadBoundedInt(valueMax uint32) (uint32, error) {
 
 	var value uint32
 
-	for mask := uint32(1); mask < valueMax; mask <<= 1 {
+	// UE3 FBitReader::ReadInt does not always consume ceil(log2(Max))
+	// bits. The already accumulated value participates in the stop
+	// condition. For example, field 345 with Max=634 consumes 9 bits.
+	for mask := uint32(1); value+mask < valueMax; mask <<= 1 {
 		bit, err := r.ReadBit()
 		if err != nil {
 			return 0, err

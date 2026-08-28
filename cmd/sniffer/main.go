@@ -218,6 +218,12 @@ func main() {
 		"log level: error, info, debug, trace",
 	)
 
+	watchCSA := flag.Bool(
+		"watch-csa",
+		false,
+		"Inspect every packet and print only controller CSA fields 338..345",
+	)
+
 	flag.Parse()
 
 	appLogger := logger.New(*logLevel)
@@ -407,21 +413,54 @@ func main() {
 			continue
 		}
 
-		// --------------------------------------------------------
-		// First try plaintext UE3 parsing.
-		// --------------------------------------------------------
-
-		uePacket, parseErr := ue3.ParsePacket(payload)
-
+		var uePacket ue3.Packet
+		var parseErr error
 		decrypted := false
 		decryptAttempted := false
 		decryptParseErr := error(nil)
 
 		// --------------------------------------------------------
-		// If plaintext parsing fails, try BTEA.
+		// In focused CSA mode the capture belongs to an established
+		// encrypted session, so prefer BTEA. The ordinary exploratory
+		// mode retains its plaintext-first behavior for login traffic.
 		// --------------------------------------------------------
 
+		if *watchCSA &&
+			*keyHex != "" &&
+			len(payload) >= 8 &&
+			len(payload)%4 == 0 {
+
+			decryptAttempted = true
+
+			decoded := append(
+				[]byte(nil),
+				payload...,
+			)
+
+			if crypto.BTEADecrypt(
+				decoded,
+				encryptionKey,
+			) {
+				decodedPacket, err :=
+					ue3.ParsePacket(decoded)
+
+				decryptParseErr = err
+
+				if err == nil {
+					uePacket = decodedPacket
+					decrypted = true
+				}
+			}
+		}
+
+		if !decrypted {
+			uePacket, parseErr = ue3.ParsePacket(payload)
+		}
+
+		// In ordinary mode, a failed plaintext parse may be an
+		// encrypted packet. Try the configured session key next.
 		if parseErr != nil &&
+			!decryptAttempted &&
 			*keyHex != "" &&
 			len(payload) >= 8 &&
 			len(payload)%4 == 0 {
@@ -504,8 +543,30 @@ func main() {
 			)
 		}
 
+		if *watchCSA {
+			direction := packetDirection(
+				uint16(udp.SrcPort),
+				uint16(udp.DstPort),
+				uint16(*srcPort),
+				uint16(*dstPort),
+			)
+
+			for i, bunch := range uePacket.Bunches {
+				logCSABunch(
+					appLogger,
+					direction,
+					uePacket.PacketID,
+					i,
+					bunch,
+				)
+			}
+
+			continue
+		}
+
 		// --------------------------------------------------------
-		// Only deeply inspect first packet of each length.
+		// Ordinary exploratory mode deeply inspects only the first
+		// packet of each length. -watch-csa bypasses this cache above.
 		// --------------------------------------------------------
 
 		if !isNewLength {
@@ -546,6 +607,120 @@ func main() {
 	// ------------------------------------------------------------
 
 	stats.Dump(appLogger)
+}
+
+func packetDirection(
+	packetSource uint16,
+	packetDestination uint16,
+	serverPort uint16,
+	clientPort uint16,
+) string {
+	if packetSource == clientPort &&
+		packetDestination == serverPort {
+		return "C2S"
+	}
+
+	if packetSource == serverPort &&
+		packetDestination == clientPort {
+		return "S2C"
+	}
+
+	return fmt.Sprintf(
+		"%d->%d",
+		packetSource,
+		packetDestination,
+	)
+}
+
+func logCSABunch(
+	appLogger *logger.Logger,
+	direction string,
+	packetID uint32,
+	index int,
+	bunch ue3.Bunch,
+) {
+	if bunch.Kind != ue3.BunchData ||
+		bunch.ChannelIndex != 2 ||
+		bunch.DataBitCount == 0 {
+		return
+	}
+
+	observation, isCSA, err := apb.DecodeCSA(
+		bunch,
+		apb.PlayerControllerFieldMax,
+	)
+	if !isCSA {
+		return
+	}
+
+	appLogger.Info(
+		"CSA %s packet=%d bunch=%d channel=%d seq=%d reliable=%v field=%d name=%s bits=%d indexBits=%d parameterBits=%d raw=%s",
+		direction,
+		packetID,
+		index,
+		bunch.ChannelIndex,
+		bunch.ChannelSequence,
+		bunch.Reliable,
+		observation.FieldIndex,
+		observation.FieldName,
+		bunch.DataBitCount,
+		observation.IndexBits,
+		observation.ParameterBits,
+		hex.EncodeToString(bunch.RawData),
+	)
+
+	if err != nil {
+		appLogger.Error(
+			"CSA %s field=%d decode failed: %v",
+			direction,
+			observation.FieldIndex,
+			err,
+		)
+		return
+	}
+
+	switch observation.FieldIndex {
+	case 343:
+		target := "absent"
+		if observation.TargetPresent {
+			targetKind := "netindex"
+			if observation.TargetByChannel {
+				targetKind = "channel"
+			}
+
+			target = fmt.Sprintf(
+				"%s:%d",
+				targetKind,
+				observation.TargetReference,
+			)
+		}
+
+		appLogger.Info(
+			"CSA %s pressed mapping=%d mappingPresent=%v aim=%d aimPresent=%v camera=%g cameraPresent=%v target=%s consumed=%d/%d trailing=%d",
+			direction,
+			observation.InputMapping,
+			observation.InputMappingPresent,
+			observation.AimRotation,
+			observation.AimRotationPresent,
+			observation.CameraCollidePercent,
+			observation.CameraPresent,
+			target,
+			observation.ConsumedBits,
+			bunch.DataBitCount,
+			observation.TrailingBits,
+		)
+
+	case 345:
+		appLogger.Info(
+			"CSA %s released mapping=%d mappingPresent=%v consumed=%d/%d trailing=%d",
+			direction,
+			observation.InputMapping,
+			observation.InputMappingPresent,
+			observation.ConsumedBits,
+			bunch.DataBitCount,
+			observation.TrailingBits,
+		)
+	}
 }
 
 func logBunch(
