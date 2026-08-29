@@ -18,6 +18,8 @@ var csaFieldNames = map[uint32]string{
 	343: "ServerCSAKeyPressed",
 	344: "ClientResetPendingCSA",
 	345: "ServerCSAKeyReleased",
+	426: "ClientCompleteAutoMoveToCSA",
+	427: "ServerCompleteSuccessfulyAutoMoveToCSA",
 }
 
 type CSAObservation struct {
@@ -43,7 +45,8 @@ type CSAObservation struct {
 }
 
 // DecodeCSA decodes the first controller field when it belongs to the CSA
-// family (338..345). The boolean result is false for an unrelated bunch.
+// family (338..345 plus the auto-move completion pair 426/427). The boolean
+// result is false for an unrelated bunch.
 func DecodeCSA(
 	bunch ue3.Bunch,
 	fieldMax uint32,
@@ -142,11 +145,20 @@ func DecodeCSA(
 				math.Float32frombits(raw)
 		}
 
-		// CPF_OptionalParm object references have no ordinary RPC
-		// non-default bit. If present, the first bit selects channel vs
-		// NetGUID and the reference follows as a UE3 bounded integer.
+		// RPC parameters carry a non-default/presence bit before the
+		// property's own serialization. For an object that is followed by
+		// the package-map selector and the channel/NetGUID reference.
 		if reader.Remaining() > 0 {
-			observation.TargetPresent = true
+			observation.TargetPresent, err = reader.ReadBit()
+			if err != nil {
+				return observation, true, fmt.Errorf(
+					"ServerCSAKeyPressed target presence: %w",
+					err,
+				)
+			}
+		}
+
+		if observation.TargetPresent {
 			observation.TargetByChannel, err = reader.ReadBit()
 			if err != nil {
 				return observation, true, fmt.Errorf(

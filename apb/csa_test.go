@@ -59,3 +59,37 @@ func TestDecodeCSAKeyReleasedFixture(t *testing.T) {
 		)
 	}
 }
+
+func TestDecodeCSACompleteAutoMoveFixture(t *testing.T) {
+	bunch := ue3.Bunch{
+		Kind:         ue3.BunchData,
+		DataBitCount: 9,
+		RawData:      []byte{0xAB, 0x01},
+	}
+
+	observation, isCSA, err := DecodeCSA(
+		bunch,
+		PlayerControllerFieldMax,
+	)
+	if err != nil {
+		t.Fatalf("DecodeCSA failed: %v", err)
+	}
+	if !isCSA {
+		t.Fatal("DecodeCSA did not recognize field 427")
+	}
+	if observation.FieldIndex != 427 ||
+		observation.FieldName != "ServerCompleteSuccessfulyAutoMoveToCSA" {
+		t.Fatalf(
+			"field = %d %q, want 427 ServerCompleteSuccessfulyAutoMoveToCSA",
+			observation.FieldIndex,
+			observation.FieldName,
+		)
+	}
+	if observation.ConsumedBits != 9 || observation.TrailingBits != 0 {
+		t.Fatalf(
+			"consumed/trailing = %d/%d, want 9/0",
+			observation.ConsumedBits,
+			observation.TrailingBits,
+		)
+	}
+}

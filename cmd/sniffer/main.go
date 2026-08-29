@@ -221,7 +221,7 @@ func main() {
 	watchCSA := flag.Bool(
 		"watch-csa",
 		false,
-		"Inspect every packet and print only controller CSA fields 338..345",
+		"Inspect every packet and print controller CSA fields 338..345 and 426..427",
 	)
 
 	flag.Parse()
