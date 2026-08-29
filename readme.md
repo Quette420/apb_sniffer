@@ -18,14 +18,14 @@ input mapping. Направления помечаются как `C2S` и `S2C`
 
 ```powershell
 Get-NetUDPEndpoint |
-    Where-Object {$_.OwningProcess -eq 25772} |
+    Where-Object {$_.OwningProcess -eq 147300} |
     ForEach-Object {
         $port = $_.LocalPort
 
         [PSCustomObject]@{
             PID       = $_.OwningProcess
             LocalPort = $port
-            Connections = Get-NetTCPConnection -OwningProcess 25772 -ErrorAction SilentlyContinue |
+            Connections = Get-NetTCPConnection -OwningProcess 147300 -ErrorAction SilentlyContinue |
                 Where-Object {
                     $_.LocalPort -eq $port -or $_.RemotePort -eq $port
                 }

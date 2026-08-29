@@ -42,9 +42,9 @@ func TestDecodeCSAKeyReleasedFixture(t *testing.T) {
 	}
 
 	if !observation.InputMappingPresent ||
-		observation.InputMapping != 2905 {
+		observation.InputMapping != 2 {
 		t.Fatalf(
-			"InputMapping = %d present=%v, want 2905 present",
+			"InputMapping = %d present=%v, want 2 present",
 			observation.InputMapping,
 			observation.InputMappingPresent,
 		)

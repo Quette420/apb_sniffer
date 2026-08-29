@@ -763,40 +763,40 @@ func logBunch(
 
 		if err != nil {
 			appLogger.Info(
-				"UNKNOWN controller field",
-				"channel", bunch.ChannelIndex,
-				"type", bunch.ChannelType,
-				"sequence", bunch.ChannelSequence,
-				"reliable", bunch.Reliable,
-				"open", bunch.Open,
-				"close", bunch.Close,
-				"data_bits", bunch.DataBitCount,
-				"data_bytes", len(bunch.RawData),
-				"error", err,
-				"raw_hex", hex.EncodeToString(bunch.RawData),
+				"UNKNOWN controller field channel=%d type=%d sequence=%d reliable=%v open=%v close=%v data_bits=%d data_bytes=%d error=%v raw_hex=%s",
+				bunch.ChannelIndex,
+				bunch.ChannelType,
+				bunch.ChannelSequence,
+				bunch.Reliable,
+				bunch.Open,
+				bunch.Close,
+				bunch.DataBitCount,
+				len(bunch.RawData),
+				err,
+				hex.EncodeToString(bunch.RawData),
 			)
 
 			appLogger.Info(
-				"UNKNOWN controller field raw dump",
-				"dump", hex.Dump(bunch.RawData),
+				"UNKNOWN controller field raw dump:\n%s",
+				hex.Dump(bunch.RawData),
 			)
 		}
 
 		for _, field := range fields {
 			if field.Known {
 				appLogger.Debug(
-					"KNOWN controller field",
-					"index", field.Index,
-					"name", field.Name,
-					"begin_bit", field.BeginBit,
-					"end_bit", field.EndBit,
+					"KNOWN controller field index=%d name=%s begin_bit=%d end_bit=%d",
+					field.Index,
+					field.Name,
+					field.BeginBit,
+					field.EndBit,
 				)
 			} else {
 				appLogger.Info(
-					"UNKNOWN controller field detail",
-					"index", field.Index,
-					"begin_bit", field.BeginBit,
-					"end_bit", field.EndBit,
+					"UNKNOWN controller field detail index=%d begin_bit=%d end_bit=%d",
+					field.Index,
+					field.BeginBit,
+					field.EndBit,
 				)
 			}
 		}
